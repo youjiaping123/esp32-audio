@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
 
 // WiFi设置
 const char* ssid = "roefruit";
@@ -11,15 +12,25 @@ const char* password = "1234567890";
 // MQTT设置
 const char* mqtt_server = "198.89.125.170";
 const int mqtt_port = 1883;
-String client_id = "esp32_audio_" + String((uint32_t)ESP.getEfuseMac(), HEX); // 使用MAC地址生成唯一ID
+String client_id = "voice_client_" + String((uint32_t)ESP.getEfuseMac() & 0xFFFFFFFF, HEX);
 String stream_topic = "voice/stream/" + client_id;
 String response_topic = "voice/response/" + client_id;
 
+// 按钮设置
+#define BUTTON_PIN 19        // 按钮引脚
+#define DEBOUNCE_TIME 50     // 消抖时间(ms)
+bool is_recording = false;   // 录音状态
+bool last_button_state = HIGH;   // 上一次按钮状态
+unsigned long last_debounce_time = 0;  // 上次消抖时间
+
 // 调试标志
-#define DEBUG_AUDIO true  // 改为true以查看更多音频相关信息
+#define DEBUG_AUDIO true
 #define DEBUG_MQTT true   
 unsigned long last_debug_time = 0;
 const unsigned long DEBUG_INTERVAL = 5000;
+
+// 发送结束标记
+const uint8_t END_MARKER[] = "END_OF_STREAM";
 
 // I2S引脚定义
 #define I2S_BCLK_OUT      26
@@ -42,7 +53,6 @@ PubSubClient mqtt_client(espClient);
 
 // 音频缓冲区
 int16_t audio_buffer[BUFFER_SIZE];
-bool is_recording = false;
 
 // 统计信息
 unsigned long total_bytes_sent = 0;
@@ -50,12 +60,17 @@ unsigned long total_bytes_received = 0;
 unsigned long packets_sent = 0;
 unsigned long packets_received = 0;
 unsigned long failed_sends = 0;
+unsigned long record_start_time = 0;  // 记录开始录音的时间
 
 void print_debug_info() {
     if (DEBUG_MQTT && (millis() - last_debug_time >= DEBUG_INTERVAL)) {
         Serial.println("\n=== 系统状态 ===");
         Serial.println("WiFi RSSI: " + String(WiFi.RSSI()) + " dBm");
         Serial.println("MQTT 连接状态: " + String(mqtt_client.connected() ? "已连接" : "未连接"));
+        Serial.println("录音状态: " + String(is_recording ? "录音中" : "停止"));
+        if (is_recording) {
+            Serial.println("录音时长: " + String((millis() - record_start_time) / 1000) + " 秒");
+        }
         Serial.println("发送统计:");
         Serial.println("- 总字节数: " + String(total_bytes_sent));
         Serial.println("- 总包数: " + String(packets_sent));
@@ -147,6 +162,7 @@ void i2s_init() {
     Serial.println("- 位深度: " + String(SAMPLE_BITS) + " bits");
     Serial.println("- 声道数: " + String(CHANNELS));
     Serial.println("- 缓冲区大小: " + String(BUFFER_SIZE) + " samples");
+    Serial.println("- 实际数据大小: " + String(BUFFER_SIZE * 2) + " bytes");
     
     // 配置I2S输出
     i2s_config_t i2s_config_tx = {
@@ -219,6 +235,10 @@ void setup() {
     Serial.println("版本: 1.0.0");
     Serial.println("编译时间: " __DATE__ " " __TIME__);
     
+    // 初始化按钮引脚
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    Serial.println("按钮已初始化 (GPIO" + String(BUTTON_PIN) + ")");
+    
     // 初始化WiFi
     setup_wifi();
     
@@ -227,6 +247,10 @@ void setup() {
     Serial.println("- 服务器: " + String(mqtt_server));
     Serial.println("- 端口: " + String(mqtt_port));
     Serial.println("- 客户端ID: " + client_id);
+    Serial.println("- MQTT最大包大小: " + String(MQTT_MAX_PACKET_SIZE) + " bytes");
+    Serial.println("- 音频缓冲区大小: " + String(BUFFER_SIZE * 2) + " bytes");
+    
+    mqtt_client.setBufferSize(MQTT_MAX_PACKET_SIZE);
     mqtt_client.setServer(mqtt_server, mqtt_port);
     mqtt_client.setCallback(mqtt_callback);
     
@@ -237,15 +261,51 @@ void setup() {
     Serial.println("MQTT主题配置:");
     Serial.println("- 发送主题: " + stream_topic);
     Serial.println("- 接收主题: " + response_topic);
+    Serial.println("\n按下按钮开始/停止录音");
+}
+
+void handle_button() {
+    bool current_button_state = digitalRead(BUTTON_PIN);
+    
+    if ((millis() - last_debounce_time) > DEBOUNCE_TIME) {
+        if (current_button_state != last_button_state) {
+            last_debounce_time = millis();
+            
+            if (current_button_state == LOW) {
+                is_recording = !is_recording;
+                
+                if (is_recording) {
+                    Serial.println("\n开始录音...");
+                    record_start_time = millis();
+                    total_bytes_sent = 0;
+                    packets_sent = 0;
+                    failed_sends = 0;
+                } else {
+                    // 发送结束标记
+                    const char* end_marker = "END_OF_STREAM";  // 使用字符串而不是��节数组
+                    mqtt_client.publish(stream_topic.c_str(), (const uint8_t*)end_marker, strlen(end_marker));
+                    
+                    Serial.println("\n停止录音");
+                    Serial.println("录音时长: " + String((millis() - record_start_time) / 1000) + " 秒");
+                    Serial.println("发送统计:");
+                    Serial.println("- 总字节数: " + String(total_bytes_sent));
+                    Serial.println("- 总包数: " + String(packets_sent));
+                    Serial.println("- 失败次数: " + String(failed_sends));
+                }
+            }
+        }
+    }
+    
+    last_button_state = current_button_state;
 }
 
 void handle_audio() {
-    if (millis() - last_send_time < MQTT_SEND_INTERVAL) {
-        return; // 控制发送频率
+    if (!is_recording || (millis() - last_send_time < MQTT_SEND_INTERVAL)) {
+        return;
     }
 
     size_t bytes_read = 0;
-    esp_err_t result = i2s_read(I2S_PORT_RX, audio_buffer, sizeof(audio_buffer), &bytes_read, 0);
+    esp_err_t result = i2s_read(I2S_PORT_RX, audio_buffer, sizeof(audio_buffer), &bytes_read, portMAX_DELAY);
     
     if (result != ESP_OK) {
         if (DEBUG_AUDIO) {
@@ -258,44 +318,53 @@ void handle_audio() {
         // 检查音频数据是否有效（不是静音）
         bool has_audio = false;
         int16_t* samples = (int16_t*)audio_buffer;
-        int sample_count = bytes_read / 2; // 16位 = 2字节
+        int sample_count = bytes_read / 2;
+        int32_t sum = 0;
         
+        // 计算音频能量
         for (int i = 0; i < sample_count; i++) {
-            if (abs(samples[i]) > 500) { // 设置合适的阈值
-                has_audio = true;
-                break;
-            }
+            sum += abs(samples[i]);
+        }
+        float average = sum / (float)sample_count;
+        
+        // 使用平均能量判断是否有效音频
+        if (average > 100) {
+            has_audio = true;
         }
 
-        if (has_audio) {
-            // 分块发送数据，每次最多发送1024字节
-            const int MAX_CHUNK_SIZE = 1024;
-            uint8_t* data = (uint8_t*)audio_buffer;
+        if (has_audio || true) {  // 暂时总是发送，用于测试
+            uint8_t* audio_data = (uint8_t*)audio_buffer;
             int remaining = bytes_read;
             int offset = 0;
-
-            while (remaining > 0) {
-                int chunk_size = min(remaining, MAX_CHUNK_SIZE);
-                bool success = mqtt_client.publish(stream_topic.c_str(), &data[offset], chunk_size);
+            
+            // 分块发送数据
+            while (remaining > 0 && is_recording) {
+                // 确保发送的数据不超过MQTT限制
+                int chunk_size = min(remaining, MQTT_MAX_PACKET_SIZE - 50);  // 留出一些余量
+                
+                bool success = mqtt_client.publish(stream_topic.c_str(), &audio_data[offset], chunk_size);
                 
                 if (success) {
                     total_bytes_sent += chunk_size;
                     packets_sent++;
                     if (DEBUG_AUDIO) {
-                        Serial.println("音频发送成功: " + String(chunk_size) + " bytes");
+                        Serial.println("音频发送成功: " + String(chunk_size) + " bytes, 偏移: " + String(offset));
                     }
+                    remaining -= chunk_size;
+                    offset += chunk_size;
                 } else {
                     failed_sends++;
                     if (DEBUG_MQTT) {
-                        Serial.println("MQTT发送失败 - 状态: " + String(mqtt_client.state()) + 
-                                    " (" + String(mqtt_state_str(mqtt_client.state())) + ")");
+                        Serial.println("MQTT发送失败 - 数据大小: " + String(chunk_size));
                     }
-                    break; // 如果发送失败，跳出循环
+                    if (!mqtt_client.connected()) {
+                        reconnect();
+                    }
+                    delay(5);  // 短暂延迟后继续
                 }
                 
-                remaining -= chunk_size;
-                offset += chunk_size;
-                delay(5); // 短暂延迟，避免发送过快
+                // 在块之间添加短暂延迟
+                delay(2);
             }
         }
     }
@@ -309,6 +378,9 @@ void loop() {
     }
     mqtt_client.loop();
 
+    // 处理按钮
+    handle_button();
+    
     // 处理音频数据
     handle_audio();
     
