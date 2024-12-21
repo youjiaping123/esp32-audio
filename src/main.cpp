@@ -4,6 +4,7 @@
 #include <AsyncMqttClient.h>
 #include <ArduinoJson.h>
 #include <AsyncTCP.h>
+#include <HTTPClient.h>
 
 // WiFi设置
 const char* ssid = "roefruit";
@@ -162,15 +163,76 @@ void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
 
 void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
     if (String(topic) == response_topic) {
-        size_t bytes_written = 0;
-        i2s_write(I2S_PORT_TX, payload, len, &bytes_written, portMAX_DELAY);
-        
-        total_bytes_received += len;
-        packets_received++;
-        
+        // 将payload转换为字符串(URL)
+        String url = String(payload, len);
         if (DEBUG_AUDIO) {
-            Serial.println("音频输出: " + String(bytes_written) + " bytes written");
+            Serial.println("收到音频URL: " + url);
         }
+        
+        // 创建HTTP客户端
+        HTTPClient http;
+        http.begin(url);
+        
+        int httpCode = http.GET();
+        if (httpCode == HTTP_CODE_OK) {
+            // 获取音频数据
+            int audio_len = http.getSize();
+            WiFiClient* stream = http.getStreamPtr();
+            
+            // 跳过WAV文件头(44字节)
+            uint8_t wav_header[44];
+            stream->readBytes(wav_header, 44);
+            
+            // 使用较小的缓冲区分块读取和播放
+            const int CHUNK_SIZE = 1024;  // 1KB的块大小
+            uint8_t* chunk = (uint8_t*)malloc(CHUNK_SIZE);
+            
+            if (chunk) {
+                size_t total_written = 0;
+                int remaining = audio_len - 44;  // 减去WAV头部大小
+                
+                while(http.connected() && remaining > 0) {
+                    // 读取一块数据
+                    size_t to_read = min(remaining, CHUNK_SIZE);
+                    size_t read_len = stream->readBytes(chunk, to_read);
+                    
+                    if (read_len > 0) {
+                        // 写入I2S
+                        size_t bytes_written = 0;
+                        esp_err_t err = i2s_write(I2S_PORT_TX, chunk, read_len, &bytes_written, portMAX_DELAY);
+                        
+                        if (err != ESP_OK) {
+                            Serial.println("I2S写入错误: " + String(esp_err_to_name(err)));
+                            break;
+                        }
+                        
+                        total_written += bytes_written;
+                        remaining -= read_len;
+                        
+                        if (DEBUG_AUDIO && (total_written % 4096 == 0)) {  // 每4KB打印一次进度
+                            Serial.println("音频播放进度: " + String(total_written) + "/" + String(audio_len - 44) + " bytes");
+                        }
+                    }
+                    
+                    // 给其他任务一些执行时间
+                    delay(1);
+                }
+                
+                free(chunk);
+                total_bytes_received += total_written;
+                packets_received++;
+                
+                if (DEBUG_AUDIO) {
+                    Serial.println("音频播放完成: " + String(total_written) + " bytes written");
+                }
+            } else {
+                Serial.println("内存分配失败 (请求大小: " + String(CHUNK_SIZE) + " bytes)");
+            }
+        } else {
+            Serial.println("HTTP请求失败，错误码: " + String(httpCode));
+        }
+        
+        http.end();
     }
 }
 
@@ -195,7 +257,8 @@ void i2s_init() {
         .dma_buf_len = BUFFER_SIZE,
         .use_apll = false,
         .tx_desc_auto_clear = true,
-        .fixed_mclk = 0
+        .fixed_mclk = 0,
+        .mclk_multiple = I2S_MCLK_MULTIPLE_256  // 添加MCLK倍率设置
     };
     
     i2s_pin_config_t pin_config_tx = {
@@ -226,7 +289,8 @@ void i2s_init() {
         .dma_buf_len = BUFFER_SIZE,
         .use_apll = false,
         .tx_desc_auto_clear = true,
-        .fixed_mclk = 0
+        .fixed_mclk = 0,
+        .mclk_multiple = I2S_MCLK_MULTIPLE_256  // 添加MCLK倍率设置
     };
     
     i2s_pin_config_t pin_config_rx = {
@@ -243,6 +307,17 @@ void i2s_init() {
     err = i2s_set_pin(I2S_PORT_RX, &pin_config_rx);
     if (err != ESP_OK) {
         Serial.println("I2S RX引脚配置失败: " + String(esp_err_to_name(err)));
+    }
+    
+    // 设置I2S时钟
+    err = i2s_set_clk(I2S_PORT_TX, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+    if (err != ESP_OK) {
+        Serial.println("I2S TX时钟设置失败: " + String(esp_err_to_name(err)));
+    }
+    
+    err = i2s_set_clk(I2S_PORT_RX, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+    if (err != ESP_OK) {
+        Serial.println("I2S RX时钟设置失败: " + String(esp_err_to_name(err)));
     }
     
     Serial.println("I2S初始化完成");
@@ -374,6 +449,14 @@ void print_debug_info() {
         if (is_recording) {
             Serial.println("录音时长: " + String((millis() - record_start_time) / 1000) + " 秒");
         }
+        
+        // 添加内存使用情况
+        Serial.println("内存状态:");
+        Serial.println("- 空闲堆内存: " + String(ESP.getFreeHeap()) + " bytes");
+        Serial.println("- 最大分配堆: " + String(ESP.getMaxAllocHeap()) + " bytes");
+        Serial.println("- 最小空闲堆: " + String(ESP.getMinFreeHeap()) + " bytes");
+        Serial.println("- 空闲PSRAM: " + String(ESP.getFreePsram()) + " bytes");
+        
         Serial.println("发送统计:");
         Serial.println("- 总字节数: " + String(total_bytes_sent));
         Serial.println("- 总包数: " + String(packets_sent));
@@ -430,7 +513,7 @@ void setup() {
     });
     
     Serial.println("\n配置MQTT客户端:");
-    Serial.println("- 服务器: " + String(mqtt_server));
+    Serial.println("- ��务器: " + String(mqtt_server));
     Serial.println("- 端口: " + String(mqtt_port));
     Serial.println("- 客户端ID: " + client_id);
     Serial.println("- MQTT版本: v5");
@@ -441,7 +524,7 @@ void setup() {
     i2s_init();
     
     // 连接WiFi
-    WiFi.disconnect();  // 确保断开之前的连接
+    WiFi.disconnect();  // 确保开之前的连接
     delay(100);
     WiFi.mode(WIFI_STA);  // 设置为Station模式
     connectToWifi();
