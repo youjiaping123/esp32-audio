@@ -11,7 +11,7 @@ const char* ssid = "roefruit";
 const char* password = "1234567890";
 
 // MQTT设置
-const char* mqtt_server = "198.89.125.170";
+const char* mqtt_server = "121.40.251.217";
 const int mqtt_port = 1883;
 String client_id = "voice_client_" + String((uint32_t)ESP.getEfuseMac() & 0xFFFFFFFF, HEX);
 String stream_topic = "voice/stream/" + client_id;
@@ -61,6 +61,67 @@ unsigned long packets_sent = 0;
 unsigned long packets_received = 0;
 unsigned long failed_sends = 0;
 unsigned long record_start_time = 0;  // 记录开始录音的时间
+
+// 音频播放缓冲区设置
+#define AUDIO_CHUNK_SIZE 256  // 更小的块大小
+#define HTTP_READ_TIMEOUT 5000  // HTTP读取超时时间(ms)
+uint8_t play_buffer[AUDIO_CHUNK_SIZE * 2];  // 双缓冲
+volatile bool is_playing = false;
+
+// 音频处理任务和队列
+TaskHandle_t audioTaskHandle = NULL;
+QueueHandle_t audioQueue;
+
+// 音频数据结构
+struct AudioData {
+    uint8_t* data;
+    size_t length;
+    bool is_last;
+};
+
+// 音频处理任务
+void audioTask(void* parameter) {
+    while(1) {
+        AudioData audioData;
+        if(xQueueReceive(audioQueue, &audioData, portMAX_DELAY)) {
+            if(audioData.data && audioData.length > 0) {
+                size_t bytes_written = 0;
+                size_t pos = 0;
+                
+                // 分块写入，每次最多64字节
+                while(pos < audioData.length) {
+                    const size_t MAX_CHUNK = 64;
+                    size_t chunk_size = (audioData.length - pos) < MAX_CHUNK ? 
+                                      (audioData.length - pos) : MAX_CHUNK;
+                    
+                    esp_err_t err = i2s_write(I2S_PORT_TX, 
+                                            audioData.data + pos, 
+                                            chunk_size, 
+                                            &bytes_written, 
+                                            portMAX_DELAY);
+                    
+                    if(err != ESP_OK) {
+                        Serial.printf("I2S写入错误: %s\n", esp_err_to_name(err));
+                        break;
+                    }
+                    
+                    pos += bytes_written;
+                    vTaskDelay(1);  // 给其他任务执行的机会
+                }
+            }
+            
+            // 释放内存
+            if(audioData.data) {
+                free(audioData.data);
+            }
+            
+            if(audioData.is_last) {
+                is_playing = false;
+            }
+        }
+        vTaskDelay(1);
+    }
+}
 
 // 函数声明
 void connectToWifi();
@@ -163,76 +224,86 @@ void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
 
 void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
     if (String(topic) == response_topic) {
-        // 将payload转换为字符串(URL)
         String url = String(payload, len);
         if (DEBUG_AUDIO) {
             Serial.println("收到音频URL: " + url);
         }
         
-        // 创建HTTP客户端
-        HTTPClient http;
-        http.begin(url);
-        
-        int httpCode = http.GET();
-        if (httpCode == HTTP_CODE_OK) {
-            // 获取音频数据
-            int audio_len = http.getSize();
-            WiFiClient* stream = http.getStreamPtr();
+        // 创建HTTP任务处理下载
+        xTaskCreate([](void* url) {
+            HTTPClient http;
+            http.begin((char*)url);
+            http.setTimeout(HTTP_READ_TIMEOUT);
             
-            // 跳过WAV文件头(44字节)
-            uint8_t wav_header[44];
-            stream->readBytes(wav_header, 44);
-            
-            // 使用较小的缓冲区分块读取和播放
-            const int CHUNK_SIZE = 1024;  // 1KB的块大小
-            uint8_t* chunk = (uint8_t*)malloc(CHUNK_SIZE);
-            
-            if (chunk) {
-                size_t total_written = 0;
-                int remaining = audio_len - 44;  // 减去WAV头部大小
+            int httpCode = http.GET();
+            if (httpCode == HTTP_CODE_OK) {
+                int audio_len = http.getSize();
+                WiFiClient* stream = http.getStreamPtr();
                 
-                while(http.connected() && remaining > 0) {
+                // 跳过WAV文件头
+                uint8_t wav_header[44];
+                stream->readBytes(wav_header, 44);
+                
+                size_t total_read = 0;
+                int remaining = audio_len - 44;
+                is_playing = true;
+                
+                while(http.connected() && remaining > 0 && is_playing) {
                     // 读取一块数据
-                    size_t to_read = min(remaining, CHUNK_SIZE);
-                    size_t read_len = stream->readBytes(chunk, to_read);
+                    size_t to_read = remaining < (int)AUDIO_CHUNK_SIZE ? 
+                                   (size_t)remaining : AUDIO_CHUNK_SIZE;
+                                   
+                    uint8_t* chunk = (uint8_t*)malloc(to_read);
                     
-                    if (read_len > 0) {
-                        // 写入I2S
-                        size_t bytes_written = 0;
-                        esp_err_t err = i2s_write(I2S_PORT_TX, chunk, read_len, &bytes_written, portMAX_DELAY);
+                    if(!chunk) {
+                        Serial.println("内存分配失败");
+                        break;
+                    }
+                    
+                    size_t read_len = stream->readBytes(chunk, to_read);
+                    if(read_len > 0) {
+                        AudioData audioData;
+                        audioData.data = chunk;
+                        audioData.length = read_len;
+                        audioData.is_last = (remaining <= (int)read_len);
                         
-                        if (err != ESP_OK) {
-                            Serial.println("I2S写入错误: " + String(esp_err_to_name(err)));
+                        // 发送到音频队列
+                        if(xQueueSend(audioQueue, &audioData, portMAX_DELAY) != pdPASS) {
+                            free(chunk);
+                            Serial.println("队列发送失败");
                             break;
                         }
                         
-                        total_written += bytes_written;
+                        total_read += read_len;
                         remaining -= read_len;
                         
-                        if (DEBUG_AUDIO && (total_written % 4096 == 0)) {  // 每4KB打印一次进度
-                            Serial.println("音频播放进度: " + String(total_written) + "/" + String(audio_len - 44) + " bytes");
+                        if (DEBUG_AUDIO && (total_read % 4096 == 0)) {
+                            Serial.printf("音频下载进度: %u/%d bytes (剩余: %d)\n", 
+                                        total_read, audio_len - 44, remaining);
                         }
+                    } else {
+                        free(chunk);
+                        delay(5);
                     }
                     
-                    // 给其他任务一些执行时间
-                    delay(1);
+                    // 给其他任务时间
+                    vTaskDelay(1);
                 }
                 
-                free(chunk);
-                total_bytes_received += total_written;
+                total_bytes_received += total_read;
                 packets_received++;
                 
                 if (DEBUG_AUDIO) {
-                    Serial.println("音频播放完成: " + String(total_written) + " bytes written");
+                    Serial.printf("音频下载完成: %u bytes\n", total_read);
                 }
             } else {
-                Serial.println("内存分配失败 (请求大小: " + String(CHUNK_SIZE) + " bytes)");
+                Serial.printf("HTTP请求失败，错误码: %d\n", httpCode);
             }
-        } else {
-            Serial.println("HTTP请求失败，错误码: " + String(httpCode));
-        }
-        
-        http.end();
+            
+            http.end();
+            free(url);
+            vTaskDelete(NULL);
+        }, "http_task", 8192, strdup(url.c_str()), 1, NULL);
     }
 }
 
@@ -513,7 +584,7 @@ void setup() {
     });
     
     Serial.println("\n配置MQTT客户端:");
-    Serial.println("- ��务器: " + String(mqtt_server));
+    Serial.println("- 服务器: " + String(mqtt_server));
     Serial.println("- 端口: " + String(mqtt_port));
     Serial.println("- 客户端ID: " + client_id);
     Serial.println("- MQTT版本: v5");
@@ -534,6 +605,20 @@ void setup() {
     Serial.println("- 发送主题: " + stream_topic);
     Serial.println("- 接收主题: " + response_topic);
     Serial.println("\n按下按钮开始/停止录音");
+    
+    // 创建音频队列
+    audioQueue = xQueueCreate(32, sizeof(AudioData));
+    
+    // 创建音频处理任务
+    xTaskCreatePinnedToCore(
+        audioTask,
+        "audioTask",
+        8192,
+        NULL,
+        1,
+        &audioTaskHandle,
+        0  // 在核心0上运行
+    );
 }
 
 void loop() {
